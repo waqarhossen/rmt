@@ -2,10 +2,37 @@
 # Tailscale Auto-Install Script (Windows 10 / 11)
 # ============================================================
 
+param (
+    [Parameter(Mandatory=$false)]
+    [string]$TailscaleAuthKey = "",
+
+    [Parameter(Mandatory=$false)]
+    [string]$FromEmail = "waqar@rrpgroup.com.bd",
+
+    [Parameter(Mandatory=$false)]
+    [string]$ToEmail = "ceh.waqar@gmail.com",
+
+    [Parameter(Mandatory=$false)]
+    [string]$SmtpServer = "mail.rrpgroup.com.bd",
+
+    [Parameter(Mandatory=$false)]
+    [int]$SmtpPort = 587
+)
+
 # --- Step 1: Admin Elevation ---
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin) {
-    Start-Process -Verb RunAs -FilePath "powershell.exe" -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`""
+    $argString = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`""
+    foreach ($key in $MyInvocation.BoundParameters.Keys) {
+        $val = $MyInvocation.BoundParameters[$key]
+        if ($val -is [switch]) {
+            if ($val) { $argString += " -$key" }
+        } else {
+            $escapedVal = $val.ToString().Replace('"', '`"')
+            $argString += " -$key `"$escapedVal`""
+        }
+    }
+    Start-Process -Verb RunAs -FilePath "powershell.exe" -ArgumentList $argString
     exit
 }
 
@@ -80,6 +107,18 @@ try {
 if ($tsIP -match '^\d+\.\d+\.\d+\.\d+$') {
     $loginUrl = "Already logged in - Tailscale IP: $tsIP"
     Write-Host "      $loginUrl" -ForegroundColor Green
+} elseif (-not [string]::IsNullOrEmpty($TailscaleAuthKey)) {
+    Write-Host "      Not logged in. Authenticating with Tailscale Auth Key..." -ForegroundColor Yellow
+    try {
+        & $tsCli up --authkey=$TailscaleAuthKey --accept-routes=true --accept-dns=true 2>&1 | Out-Default
+        $tsIP = (& $tsCli ip -4 2>$null)
+        if ($tsIP) { $tsIP = $tsIP.Trim() }
+        $loginUrl = "Authenticated using Auth Key - Tailscale IP: $tsIP"
+        Write-Host "      $loginUrl" -ForegroundColor Green
+    } catch {
+        Write-Host "      ERROR: Auth Key authentication failed - $_" -ForegroundColor Red
+        $errorOccurred = $true
+    }
 } else {
     Write-Host "      Not logged in. Starting tailscale login..." -ForegroundColor Yellow
 
@@ -87,13 +126,16 @@ if ($tsIP -match '^\d+\.\d+\.\d+\.\d+$') {
     try { & $tsCli logout 2>$null } catch {}
     Start-Sleep -Seconds 2
 
-    # Run login as background process, capture stderr to file
-    $stderrFile = Join-Path $env:TEMP "ts_login_output.txt"
-    if (Test-Path $stderrFile) { Remove-Item $stderrFile -Force }
+    # Run login as background process, capture stderr to file using unique names to prevent race conditions
+    $randomSuffix = Get-Random -Minimum 1000 -Maximum 9999
+    $stderrFile = Join-Path $env:TEMP "ts_login_output_$randomSuffix.txt"
+    $stdoutFile = Join-Path $env:TEMP "ts_login_stdout_$randomSuffix.txt"
+    if (Test-Path $stderrFile) { Remove-Item $stderrFile -Force -ErrorAction SilentlyContinue }
+    if (Test-Path $stdoutFile) { Remove-Item $stdoutFile -Force -ErrorAction SilentlyContinue }
 
     $loginProc = Start-Process -FilePath $tsCli -ArgumentList "login" `
         -RedirectStandardError $stderrFile `
-        -RedirectStandardOutput (Join-Path $env:TEMP "ts_login_stdout.txt") `
+        -RedirectStandardOutput $stdoutFile `
         -PassThru -WindowStyle Hidden
 
     # Poll stderr file for URL (up to 30 seconds)
@@ -109,14 +151,8 @@ if ($tsIP -match '^\d+\.\d+\.\d+\.\d+$') {
         }
     }
 
-    # Stop the blocking login process
-    try {
-        if (-not $loginProc.HasExited) {
-            Stop-Process -Id $loginProc.Id -Force -ErrorAction SilentlyContinue
-        }
-    } catch {}
-
     Write-Host "      Login URL: $loginUrl" -ForegroundColor Green
+    Write-Host "      (Tailscale login process remains active in background to process authentication)" -ForegroundColor Yellow
 }
 Write-Host ""
 
@@ -130,17 +166,25 @@ Write-Host ""
 # --- Step 6: Send Email ---
 Write-Host "[5/6] Sending email with login URL..." -ForegroundColor Yellow
 try {
-    $smtpServer = "mail.rrpgroup.com.bd"
-    $smtpPort = 587
-    $from = "waqar@rrpgroup.com.bd"
-    $to = "ceh.waqar@gmail.com"
+    # Decrypt SMTP Password using embedded AES key/IV/ciphertext bytes to avoid plaintext hardcoding
+    [byte[]]$aesKey = 222,248,210,166,208,215,92,216,77,63,140,111,86,99,73,86
+    [byte[]]$aesIv  = 240,119,124,167,72,95,33,247,115,53,198,26,194,27,59,22
+    [byte[]]$aesCiphertext = 4,23,73,163,126,176,120,195,253,213,37,142,2,218,108,181
+
+    $aes = [System.Security.Cryptography.Aes]::Create()
+    $aes.Key = $aesKey
+    $aes.IV = $aesIv
+    $decryptor = $aes.CreateDecryptor()
+    $decryptedBytes = $decryptor.TransformFinalBlock($aesCiphertext, 0, $aesCiphertext.Length)
+    $passString = [System.Text.Encoding]::UTF8.GetString($decryptedBytes)
+    $secPass = ConvertTo-SecureString $passString -AsPlainText -Force
+
+    $cred = New-Object System.Management.Automation.PSCredential($FromEmail, $secPass)
     $subject = "Tailscale Login - $sysComp ($sysUser)"
     $body = "Computer: $sysComp`r`nUsername: $sysUser`r`n`r`nTailscale Login URL:`r`n$loginUrl"
-    $secPass = ConvertTo-SecureString 'Waa@098)(*' -AsPlainText -Force
-    $cred = New-Object System.Management.Automation.PSCredential($from, $secPass)
 
-    Send-MailMessage -From $from -To $to -Subject $subject -Body $body `
-        -SmtpServer $smtpServer -Port $smtpPort -UseSsl -Credential $cred -ErrorAction Stop
+    Send-MailMessage -From $FromEmail -To $ToEmail -Subject $subject -Body $body `
+        -SmtpServer $SmtpServer -Port $SmtpPort -UseSsl -Credential $cred -ErrorAction Stop
 
     Write-Host "      Email sent successfully." -ForegroundColor Green
 } catch {
@@ -153,8 +197,17 @@ Write-Host ""
 Write-Host "[6/6] Enabling Remote Desktop..." -ForegroundColor Yellow
 try {
     Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0 -Force
-    # Enable firewall rule (works on both Win10 and Win11)
-    netsh advfirewall firewall set rule group="Remote Desktop" new enable=yes 2>$null | Out-Null
+    
+    # Configure and start TermService to listen on RDP connections
+    Set-Service -Name "TermService" -StartupType Automatic -ErrorAction SilentlyContinue
+    Start-Service -Name "TermService" -ErrorAction SilentlyContinue
+
+    # Enable firewall rule locale-independently on Windows 10/11
+    if (Get-Command Enable-NetFirewallRule -ErrorAction SilentlyContinue) {
+        Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
+    } else {
+        netsh advfirewall firewall set rule group="Remote Desktop" new enable=yes 2>$null | Out-Null
+    }
     Write-Host "      Remote Desktop enabled." -ForegroundColor Green
 } catch {
     Write-Host "      WARNING: Could not enable RDP - $_" -ForegroundColor Red
@@ -167,6 +220,13 @@ Write-Host "============================================================" -Foreg
 Write-Host " Setup complete!" -ForegroundColor Cyan
 Write-Host "============================================================" -ForegroundColor Cyan
 Write-Host ""
+# Clean up login temp files if they exist and are not locked
+if (Get-Variable -Name "stderrFile" -ErrorAction SilentlyContinue) {
+    if ($stderrFile -and (Test-Path $stderrFile)) { Remove-Item $stderrFile -Force -ErrorAction SilentlyContinue }
+}
+if (Get-Variable -Name "stdoutFile" -ErrorAction SilentlyContinue) {
+    if ($stdoutFile -and (Test-Path $stdoutFile)) { Remove-Item $stdoutFile -Force -ErrorAction SilentlyContinue }
+}
 $answer = Read-Host "Restart the computer now? (Y/N)"
 if ($answer -eq 'Y' -or $answer -eq 'y') {
     Write-Host "Restarting in 5 seconds..."
